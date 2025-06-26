@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BTC DCA Strategy</title>
+  <style>
+    body { font-family: monospace; background: #121212; color: #00ff99; padding: 1rem; }
+    .card { background: #1e1e1e; padding: 1rem; border-radius: 10px; margin-bottom: 1rem; }
+    label { display: block; margin-top: 0.5rem; }
+    input { width: 100%; padding: 0.4rem; margin-bottom: 0.5rem; background: #333; color: #00ff99; border: none; border-radius: 5px; }
+    button { padding: 0.5rem; border: none; border-radius: 5px; margin-top: 0.5rem; background: #00ff99; color: #000; cursor: pointer; width: 100%; }
+    .log { max-height: 300px; overflow-y: auto; background: #0d0d0d; padding: 0.5rem; border-radius: 6px; font-size: 0.9rem; }
+    .log-entry { margin-bottom: 0.5rem; border-bottom: 1px dashed #444; padding-bottom: 0.3rem; }
+    .log-entry strong { color: #ffd700; }
+  </style>
+</head>
+<body>
+
+<div class="card">
+  <h2>Strategy Setup</h2>
+  <label>Starting Capital (USD):</label>
+  <input id="startingCapital" type="number" value="100" />
+
+  <label>% Drop to Buy:</label>
+  <input id="dropPct" type="number" value="5" />
+
+  <label>Buy Hold Min (min):</label>
+  <input id="buyMin" type="number" value="5" />
+  <label>Buy Hold Max (min):</label>
+  <input id="buyMax" type="number" value="30" />
+
+  <label>% Rise to Sell:</label>
+  <input id="risePct" type="number" value="5" />
+  <label>Sell Hold Min (min):</label>
+  <input id="sellMin" type="number" value="1" />
+  <label>Sell Hold Max (min):</label>
+  <input id="sellMax" type="number" value="30" />
+
+  <label>Daily Realization Time (UTC hh:mm):</label>
+  <input id="realizeTime" type="text" value="00:00" />
+
+  <button onclick="startBot()">Start Strategy</button>
+</div>
+
+<div class="card">
+  <h2>Current Status</h2>
+  <p>Price: <span id="price">-</span></p>
+  <p>Status: <span id="status">Waiting...</span></p>
+  <p>BTC: <span id="btcHoldings">0</span></p>
+  <p>USD: <span id="usdHoldings">0</span></p>
+  <p>Total: <span id="totalValue">0</span></p>
+  <p>Profit Realized: <span id="profit">0</span></p>
+</div>
+
+<div class="card">
+  <h2>Trade History</h2>
+  <div class="log" id="logHistory"></div>
+  <button onclick="downloadCSV()">📥 Download CSV</button>
+</div>
+
+<script>
+let usd = 0, btc = 0, lastBuyPrice = null, lastSellPrice = null;
+let profit = 0, priceHistory = [], tradeLog = [], lastRealizeDate = null;
+const INTERVAL = 10000;
+let realizeTimeStr = "00:00";
+
+async function getPrice() {
+  try {
+    const res = await fetch("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT");
+    const data = await res.json();
+    return parseFloat(data.price);
+  } catch (e) {
+    console.log("API error, using fallback");
+    return priceHistory.length ? priceHistory[priceHistory.length - 1].price : 30000;
+  }
+}
+
+function logAction(type, price, note) {
+  const now = new Date().toISOString();
+  const entry = { type, price, btc: btc.toFixed(6), usd: usd.toFixed(2), time: now, note };
+  tradeLog.push(entry);
+  const logDiv = document.getElementById("logHistory");
+  const line = document.createElement("div");
+  line.className = "log-entry";
+  line.innerHTML = `<strong>[${type}]</strong> ${now} — $${price.toFixed(2)} — ${note}`;
+  logDiv.prepend(line);
+}
+
+function updateUI(price) {
+  document.getElementById("price").textContent = "$" + price.toFixed(2);
+  document.getElementById("btcHoldings").textContent = btc.toFixed(6);
+  document.getElementById("usdHoldings").textContent = usd.toFixed(2);
+  document.getElementById("totalValue").textContent = (usd + btc * price).toFixed(2);
+  document.getElementById("profit").textContent = profit.toFixed(2);
+}
+
+function timeToSeconds(t) {
+  const [hh, mm] = t.split(":").map(Number);
+  return hh * 3600 + mm * 60;
+}
+
+function checkRealizationTime(nowUTC) {
+  const targetSec = timeToSeconds(realizeTimeStr);
+  const currentSec = nowUTC.getUTCHours() * 3600 + nowUTC.getUTCMinutes() * 60;
+  const today = nowUTC.toISOString().split("T")[0];
+  return (currentSec >= targetSec && lastRealizeDate !== today);
+}
+
+async function loop(params) {
+  const price = await getPrice();
+  const now = Date.now() / 1000;
+  const nowUTC = new Date();
+  updateUI(price);
+
+  priceHistory.push({ price, time: now });
+  const maxWindow = Math.max(params.buyMaxHold, params.sellMaxHold) * 60;
+  priceHistory = priceHistory.filter(p => now - p.time <= maxWindow);
+  const priceBuyMinAgo = priceHistory.find(p => now - p.time >= params.buyMinHold * 60);
+  const priceSellMinAgo = priceHistory.find(p => now - p.time >= params.sellMinHold * 60);
+
+  if (!lastBuyPrice && priceBuyMinAgo && price <= priceBuyMinAgo.price * (1 - params.buyDrop)) {
+    lastBuyPrice = price;
+    btc = usd / price;
+    usd = 0;
+    logAction("BUY", price, `Price dropped ${params.buyDrop * 100}% from 5 min ago.`);
+    document.getElementById("status").textContent = `BUY @ $${price.toFixed(2)}`;
+  } else if (lastBuyPrice && priceSellMinAgo && price >= lastBuyPrice * (1 + params.sellRise)) {
+    lastSellPrice = price;
+    const totalValue = btc * price;
+    const half = totalValue / 2;
+    profit += (half - lastBuyPrice * (btc / 2));
+    usd = half;
+    btc = half / price;
+    logAction("SELL", price, `Price rose ${params.sellRise * 100}% from last buy.`);
+    lastBuyPrice = null;
+    document.getElementById("status").textContent = `SELL 50% @ $${price.toFixed(2)}`;
+  }
+
+  if (checkRealizationTime(nowUTC)) {
+    const total = usd + btc * price;
+    usd = total / 2;
+    btc = usd / price;
+    lastRealizeDate = nowUTC.toISOString().split("T")[0];
+    logAction("REALIZE", price, `Daily profit realization triggered.`);
+    document.getElementById("status").textContent = `⏳ Realizing profits`;
+  }
+
+  setTimeout(() => loop(params), INTERVAL);
+}
+
+function startBot() {
+  usd = parseFloat(document.getElementById("startingCapital").value);
+  btc = 0;
+  profit = 0;
+  lastBuyPrice = null;
+  lastSellPrice = null;
+  priceHistory = [];
+  lastRealizeDate = null;
+  document.getElementById("logHistory").innerHTML = '';
+
+  const params = {
+    buyDrop: parseFloat(document.getElementById("dropPct").value) / 100,
+    buyMinHold: parseInt(document.getElementById("buyMin").value),
+    buyMaxHold: parseInt(document.getElementById("buyMax").value),
+    sellRise: parseFloat(document.getElementById("risePct").value) / 100,
+    sellMinHold: parseInt(document.getElementById("sellMin").value),
+    sellMaxHold: parseInt(document.getElementById("sellMax").value),
+  };
+
+  realizeTimeStr = document.getElementById("realizeTime").value;
+  document.getElementById("status").textContent = "Bot Started...";
+  loop(params);
+}
+
+function downloadCSV() {
+  let csv = "type,price,btc,usd,time,note\n";
+  tradeLog.forEach(t => {
+    csv += `${t.type},${t.price},${t.btc},${t.usd},${t.time},"${t.note}"\n`;
+  });
+  const blob = new Blob([csv], { type: "text/csv" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "btc_trade_log.csv";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>
